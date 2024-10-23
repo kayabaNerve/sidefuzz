@@ -4,33 +4,38 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::time::Instant;
 
-use wasmi::{ImportsBuilder, MemoryRef, Module, ModuleInstance, ModuleRef, NopExternals};
+use wasmi::*;
 
 pub struct WasmModule {
     module: Vec<u8>,
-    instance: ModuleRef,
-    memory: MemoryRef,
-    fuzz_ptr: u32,
+    store: Store<()>,
+    instance: Instance,
+    memory: Memory,
+    fuzz_ptr: usize,
     fuzz_len: u32,
     input_is_str: bool,
 }
 
 impl WasmModule {
     pub fn new(module: Vec<u8>) -> Result<Self, SideFuzzError> {
-        let parsed = Module::from_buffer(&module).unwrap();
-        let instance = ModuleInstance::new(&parsed, &ImportsBuilder::default())?.assert_no_start();
+	let engine = Engine::new(&Config::default().consume_fuel(true));
+
+        let parsed = Module::new(&engine, module.as_slice())?;
+	let mut store = Store::new(parsed.engine(), ());
+        let instance = Linker::<()>::new().instantiate(&mut store, &parsed)?.ensure_no_start(&mut store)?;
 
         // Get memory instance exported by name 'mem' from the module instance.
-        let memory = instance.export_by_name("memory");
+        let memory = instance.get_export(&store, "memory");
         let memory = memory.ok_or(SideFuzzError::WasmModuleNoMemory)?;
         let memory = memory
-            .as_memory()
+            .into_memory()
             .ok_or(SideFuzzError::WasmModuleBadMemory)?;
 
         let mut wasm_module = Self {
             module: module,
+	    store: store,
             instance: instance,
-            memory: memory.to_owned(),
+            memory: memory,
             fuzz_ptr: 0,
             fuzz_len: 0,
             input_is_str: false,
@@ -60,6 +65,7 @@ impl WasmModule {
         self.input_is_str
     }
 
+
     pub fn bytes(&self) -> Vec<u8> {
         self.module.clone()
     }
@@ -67,21 +73,21 @@ impl WasmModule {
     // Count instructions for a given input
     pub fn count_instructions(&mut self, input: &[u8]) -> Result<u64, SideFuzzError> {
         self.memory
-            .set(self.fuzz_ptr, input)
-            .map_err(|e| SideFuzzError::MemorySetError(e))?;
-        wasmi::reset_instruction_count();
-        let result = self.instance.invoke_export("fuzz", &[], &mut NopExternals);
+            .write(&mut self.store, self.fuzz_ptr, input)
+            .map_err(|e| SideFuzzError::MemorySetError(e.into()))?;
+        self.store.add_fuel(u64::MAX - self.store.fuel_consumed().unwrap()).unwrap();
+        let result = self.instance.get_export(&self.store, "fuzz").ok_or(SideFuzzError::WasmModuleNoInputPointer)?.into_func().ok_or(SideFuzzError::WasmModuleNoInputPointer)?.call(&mut self.store, &[], &mut []);
         if let Err(err) = result {
             // If we've got a MemoryAccessOutOfBounds error, then we've corrupted our memory.
             // In a real application this would be a crash, so reboot the instance and start over.
             if let wasmi::Error::Trap(trap) = &err {
-                if let wasmi::TrapKind::MemoryAccessOutOfBounds = trap.kind() {
+                if let Some(wasmi::core::TrapCode::MemoryOutOfBounds) = trap.trap_code() {
                     self.reboot();
                 }
             }
             return Err(SideFuzzError::WasmError(err));
         }
-        let count = wasmi::get_instruction_count();
+        let count = u64::MAX - self.store.fuel_consumed().unwrap();
 
         Ok(count)
     }
@@ -90,8 +96,9 @@ impl WasmModule {
     fn reboot(&mut self) {
         // This should be ok to expect here since the module has already been instantiated previously.
         let new = Self::new(self.module.clone()).expect("Could not reboot wasm module instance.");
-        self.instance = new.instance;
-        self.memory = new.memory;
+	self.store = new.store;
+	self.instance = new.instance;
+	self.memory = new.memory;
     }
 
     // Measure and report the running time for a single execution
@@ -127,32 +134,37 @@ impl WasmModule {
         let _ = crate::black_box(self.count_instructions(&vec![]));
 
         // Call the "input_pointer" exported function to get the pointer to the input
-        let input_pointer = self
+        let mut input_pointer = vec![wasmi::Value::I32(0); 1];
+        self
             .instance
-            .invoke_export("input_pointer", &[], &mut NopExternals)?
-            .ok_or(SideFuzzError::WasmModuleNoInputPointer)?;
+            .get_export(&self.store, "input_pointer").ok_or(SideFuzzError::WasmModuleNoInputPointer)?.into_func().ok_or(SideFuzzError::WasmModuleNoInputPointer)?.call(&mut self.store, &[], &mut input_pointer)?;
 
         // Call the "input_len" exported function to get the input length
-        let input_len = self
+        let mut input_len = vec![wasmi::Value::I64(0); 1];
+        dbg!(self
             .instance
-            .invoke_export("input_len", &[], &mut NopExternals)?
-            .ok_or(SideFuzzError::WasmModuleNoInputLen)?;
+            .get_export(&self.store, "input_len").ok_or(SideFuzzError::WasmModuleBadInpuLen)?.into_func().ok_or(SideFuzzError::WasmModuleBadInpuLen)?.call(&mut self.store, &[], &mut input_len))?;
+        dbg!(input_len.clone());
 
         // Call the "input_is_str" exported function to check if input is a string
-        let input_is_str = self
+        dbg!(0);
+        let mut input_is_str = vec![wasmi::Value::I32(0); 1];
+        dbg!(self.instance.exports(&self.store));
+        dbg!(self
             .instance
-            .invoke_export("input_is_str", &[], &mut NopExternals)?
-            .ok_or(SideFuzzError::WasmModuleNoInputLen)?;
+            .get_export(&self.store, "input_is_str")).ok_or(SideFuzzError::WasmModuleBadInpuLen)?.into_func().ok_or(SideFuzzError::WasmModuleBadInpuLen)?.call(&mut self.store, &[], &mut input_is_str)?;
+        dbg!(1);
 
-        let input_pointer = match input_pointer {
-            wasmi::RuntimeValue::I32(inner) => inner,
+        let input_pointer = match input_pointer[0] {
+            wasmi::Value::I32(inner) => inner,
             _ => {
                 return Err(SideFuzzError::WasmModuleBadInputPointer);
             }
         };
+        dbg!(2);
 
-        let input_len = match input_len {
-            wasmi::RuntimeValue::I32(inner) => inner,
+        let input_len = match dbg!(input_len[0].clone()) {
+            wasmi::Value::I32(inner) => inner,
             _ => {
                 return Err(SideFuzzError::WasmModuleBadInpuLen);
             }
@@ -161,16 +173,16 @@ impl WasmModule {
             return Err(SideFuzzError::FuzzLenTooLong(input_len as u32));
         }
 
-        let input_is_str = match input_is_str {
-            wasmi::RuntimeValue::I32(inner) => inner > 0,
-            _ => {
-                return Err(SideFuzzError::WasmModuleBadInpuLen);
-            }
-        };
+let input_is_str = match input_is_str[0] {
+wasmi::Value::I32(inner) => inner > 0,
+_ => {
+return Err(SideFuzzError::WasmModuleBadInpuLen);
+}
+};
 
-        self.fuzz_ptr = input_pointer as u32;
-        self.fuzz_len = input_len as u32;
-        self.input_is_str = input_is_str;
+self.fuzz_ptr = input_pointer as usize;
+self.fuzz_len = input_len as u32;
+self.input_is_str = input_is_str;
 
         Ok(())
     }

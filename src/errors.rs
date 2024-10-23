@@ -22,6 +22,9 @@ pub enum SideFuzzError {
     #[fail(display = "wasm error: {}", 0)]
     WasmError(WasmError),
 
+    #[fail(display = "wasm error: {}", 0)]
+    WasmInstantiationError(wasmi::errors::InstantiationError),
+
     #[fail(display = "wasm module expected to have 'memory' export")]
     WasmModuleNoMemory,
 
@@ -62,5 +65,12 @@ impl From<IOError> for SideFuzzError {
 impl From<WasmError> for SideFuzzError {
     fn from(error: WasmError) -> Self {
         SideFuzzError::WasmError(error)
+    }
+}
+
+
+impl From<wasmi::errors::InstantiationError> for SideFuzzError {
+    fn from(error: wasmi::errors::InstantiationError) -> Self {
+        SideFuzzError::WasmInstantiationError(error)
     }
 }
