@@ -18,7 +18,7 @@ rolling-stats = "0.3.0"
 clap = "2.33.0"
 failure = "0.1.5"
 color-backtrace = { version = "0.4.2" }
-float_duration = { git = "https://github.com/phayes/rust-float-duration" }
+float_duration = { git = "https://github.com/tylerreisinger/rust-float-duration" }
 wasmi = { path = "./vendor/wasmi" }
 
 [dependencies]
